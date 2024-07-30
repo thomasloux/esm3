@@ -52,6 +52,9 @@ from esm.utils.structure.affine3d import (
     build_affine3d_from_coordinates,
 )
 
+## Additional imports
+from esm.utils.generation import _stack_protein_tensors
+
 
 @dataclass
 class ESMOutput:
@@ -308,6 +311,7 @@ class ESM3(nn.Module, ESM3InferenceClient):
 
         """
         # Reasonable defaults:
+        # print("sequence_tokens", sequence_tokens)
         try:
             L, device = next(
                 (x.shape[1], x.device)
@@ -380,6 +384,12 @@ class ESM3(nn.Module, ESM3InferenceClient):
             residue_annotation_tokens,
         )
         x, embedding = self.transformer(x, sequence_id, affine, affine_mask, chain_id)
+        # print("weigth of Layer Norm", self.transformer.norm.weight)
+        # print("bias of Layer Norm", self.transformer.norm.bias)
+        # print("x", x)
+        # print("embedding", embedding.shape)
+        # layerNorm_no_learnable = nn.LayerNorm(x.size()[1:], elementwise_affine=False)
+        # print("layer_norm plain times the weight", layerNorm_no_learnable(x) * self.transformer.norm.weight)
         return self.output_heads(x, embedding)
 
     # The following methods are for the ESM3InferenceClient interface
@@ -604,3 +614,189 @@ class ESM3(nn.Module, ESM3InferenceClient):
 
         # There is only 1 prompt to sample for.
         return _slice_tensor_dataclass(forward_and_sample_out, 0)
+
+    def get_embeddings(
+            self, input: ESMProteinTensor
+        ):
+        """
+        Largely inspired by forward and sample
+        removing the lines to sample (remove lines 574 to 576 about sampling_config
+        and lines 598 to 603 to sample)
+        """
+        protein_tensor = attr.evolve(input)  # Make a copy
+
+        device = next(self.parameters()).device
+
+        # Initialize default values for missing tracks
+        default_protein_tensor = ESMProteinTensor.empty(
+            len(input) - 2, tokenizers=self.tokenizers, device=input.device
+        )
+        for track in attr.fields(ESMProteinTensor):
+            if getattr(protein_tensor, track.name, None) is None:
+                setattr(
+                    protein_tensor,
+                    track.name,
+                    getattr(default_protein_tensor, track.name, None),
+                )
+
+        if len(protein_tensor) <= 0:
+            raise ValueError("No input data provided")
+
+        # Move input protein to proper device.
+        batched_protein = _BatchedESMProteinTensor.from_protein_tensor(protein_tensor)
+        batched_protein.to(device)
+
+        forward_output: ForwardOutput = _batch_forward(self, batched_protein)
+        with (
+            torch.no_grad(),  # Assume no gradients for now...
+            torch.autocast(enabled=True, device_type=device.type, dtype=torch.bfloat16)  # type: ignore
+            if device.type == "cuda"
+            else contextlib.nullcontext(),
+        ):  
+            embedding_norm_layer = self.transformer.norm(forward_output.embeddings)
+
+        return forward_output.embeddings, embedding_norm_layer
+
+    def get_embeddings_batched(
+            self, input_tokens: list[ESMProteinTensor]
+        ):
+        """
+        Largely inspired by iterative_sampling_tokens 
+        from lines 293 to 340 : to obtain the _BatchedESMProteinTensor
+        then get_embeddings to actually get the embeddings
+        """
+            
+        devices = set([t.device for t in input_tokens])
+        if len(devices) > 1:
+            raise AttributeError(f"Input tokens on multiple devices {devices}")
+
+        sampled_tokens = [attr.evolve(tokens) for tokens in input_tokens]
+
+        # # Clear structure tokens if user would like to condition only on coordinates.
+        # for tokens, config in zip(sampled_tokens, configs):
+        #     if config.condition_on_coordinates_only and tokens.coordinates is not None:
+        #         tokens.structure = None
+
+        # Total sequence lengths.
+        sequence_lengths = [len(tokens) for tokens in sampled_tokens]
+        # Figure out the number of tokens to be sampled for each prompt.
+        # total_to_sample = []
+        # for protein, seq_len, config in zip(sampled_tokens, sequence_lengths, configs):
+        #     track = config.track
+
+        #     if getattr(protein, track) is None:
+        #         # We need to sample the entire track.
+        #         total_to_sample.append(seq_len - 2)
+        #         continue
+
+        #     masked = _get_masked_positions(
+        #         track,
+        #         getattr(protein, track),
+        #         getattr(self.tokenizers, track).mask_token_id,
+        #     )
+        #     total_to_sample.append(torch.sum(masked))
+
+            # Different prompts may ask for different number of decoding steps.
+            # For now, we simply run the max number of steps.
+            # TODO: return completed proteins as soon as they are finished sampling.
+
+        # Now stack the list to make a single batched ESMProteinTensor.
+        device = devices.pop()
+        batched_tokens = _stack_protein_tensors(
+            sampled_tokens,
+            sequence_lengths,
+            self.tokenizers,
+            device,
+        )
+
+        forward_output: ForwardOutput = _batch_forward(self, batched_tokens)
+        with (
+            torch.no_grad(),  # Assume no gradients for now...
+            torch.autocast(enabled=True, device_type=device.type, dtype=torch.bfloat16)  # type: ignore
+            if device.type == "cuda"
+            else contextlib.nullcontext(),
+        ):  
+            embedding_norm_layer = self.transformer.norm(forward_output.embeddings)
+
+        return forward_output.embeddings.cpu(), embedding_norm_layer.cpu()
+
+def encode(tokenizers, structure_encoder, input: ESMProtein, device) -> ESMProteinTensor:
+    input = attr.evolve(input)  # Make a copy
+
+    sequence_tokens = None
+    structure_tokens = None
+    secondary_structure_tokens = None
+    sasa_tokens = None
+    function_tokens = None
+    residue_annotation_tokens = None
+
+    coordinates = None
+
+    if input.sequence is not None:
+        sequence_tokens = encoding.tokenize_sequence(
+            input.sequence, tokenizers.sequence, add_special_tokens=True
+        )
+    if input.secondary_structure is not None:
+        secondary_structure_tokens = encoding.tokenize_secondary_structure(
+            input.secondary_structure,
+            tokenizers.secondary_structure,
+            add_special_tokens=True,
+        )
+    if input.sasa is not None:
+        sasa_tokens = encoding.tokenize_sasa(
+            input.sasa, tokenizers.sasa, add_special_tokens=True
+        )
+
+    # Infer input length
+    sequence_length = -1
+    if sequence_tokens is not None:
+        sequence_length = len(sequence_tokens)
+    elif secondary_structure_tokens is not None:
+        sequence_length = len(secondary_structure_tokens)
+    elif sasa_tokens is not None:
+        sequence_length = len(sasa_tokens)
+
+    # Try to infer input length from structure data
+    if input.coordinates is not None:
+        coordinates, _, structure_tokens = encoding.tokenize_structure(
+            input.coordinates,
+            structure_encoder,
+            structure_tokenizer=tokenizers.structure,
+            reference_sequence=input.sequence or "",
+            add_special_tokens=True,
+        )
+        if sequence_length == -1:
+            sequence_length = len(structure_tokens)
+
+    if sequence_length == -1:
+        raise ValueError(
+            "Cannot infer input length from input data. Please provide one of: sequence, structure, secondary_structure, sasa.\n"
+            "To condition on sequence length only, use ESM3LocalInferenceClient.get_default_sequence(sequence_length) to generate a default sequence input."
+        )
+
+    # Function and Residue annotations
+    if input.function_annotations is not None:
+        if input.sequence is None:
+            reference_sequence = encoding.get_default_sequence(sequence_length - 2)
+        else:
+            reference_sequence = input.sequence
+        (
+            function_tokens,
+            residue_annotation_tokens,
+        ) = encoding.tokenize_function_annotations(
+            input.function_annotations,
+            reference_sequence=reference_sequence,
+            function_tokenizer=tokenizers.function,
+            residue_annotation_tokenizer=tokenizers.residue_annotations,
+            add_special_tokens=True,
+        )
+
+    return ESMProteinTensor(
+        sequence=sequence_tokens,
+        structure=structure_tokens,
+        secondary_structure=secondary_structure_tokens,
+        sasa=sasa_tokens,
+        function=function_tokens,
+        residue_annotations=residue_annotation_tokens,
+        coordinates=coordinates,
+    ).to(device)
